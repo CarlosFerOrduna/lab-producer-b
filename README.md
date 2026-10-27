@@ -4,7 +4,7 @@ One of the two producer services of the lab: a NestJS service that will publish 
 
 ## Role in the lab
 
-Runs in its own `producer-b` namespace of the k3s cluster. [lab-producer-a](https://github.com/CarlosFerOrduna/lab-producer-a) has the same shape in its own namespace, and both feed the single processor in the `platform` namespace. ArgoCD deploys it from [lab-gitops](https://github.com/CarlosFerOrduna/lab-gitops) (`producer-b/`).
+Runs in its own `producer-b` namespace of the k3s cluster. [lab-producer-a](https://github.com/CarlosFerOrduna/lab-producer-a) runs in its own namespace too, and both feed the single processor in the `platform` namespace. Unlike lab-producer-a, it has a PostgreSQL database of its own. ArgoCD deploys it from [lab-gitops](https://github.com/CarlosFerOrduna/lab-gitops) (`producer-b/`).
 
 ## Status
 
