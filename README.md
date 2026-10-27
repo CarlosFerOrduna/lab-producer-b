@@ -31,7 +31,9 @@ Planned:
 - Publish events to Kafka topics under `producer-b.*`.
 - Call the processor through the platform gateway, never directly.
 - One Redis for cache and a separate Redis for BullMQ queues.
-- No database of its own: persistent data belongs to the processor.
+- Its own PostgreSQL, in two steps:
+  1. Start with PostgreSQL bundled in the service's docker compose. This is the other pattern services use today, next to the embedded SQLite that [lab-processor](https://github.com/CarlosFerOrduna/lab-processor) starts with.
+  2. Move that PostgreSQL out of the service's package and into the cluster, as a StatefulSet with its own volume, its own Secret and its own lifecycle, migrating its data. Same engine: the change is where and how the database lives, not what it is.
 - Graceful shutdown: stop accepting work, flush pending messages, then exit.
 
 ## Run locally
