@@ -1,0 +1,47 @@
+# Today's starting point: PostgreSQL bundled in the service's own compose.
+# POSTGRES_PASSWORD comes from a local .env file, which is never committed.
+x-database: &database
+  DATABASE_HOST: postgres
+  DATABASE_NAME: producer_b
+  DATABASE_USER: producer_b
+  DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
+services:
+  postgres:
+    image: postgres:18.6-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
+    environment:
+      POSTGRES_DB: producer_b
+      POSTGRES_USER: producer_b
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U producer_b -d producer_b']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - postgres-data:/var/lib/postgresql
+
+  migrate:
+    build: .
+    image: lab-producer-b:local
+    command: ['node', 'dist/migrate.js']
+    environment: *database
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  producer-b:
+    image: lab-producer-b:local
+    environment:
+      <<: *database
+      PROCESSOR_URL: http://host.docker.internal:3000
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - '3002:3000'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
