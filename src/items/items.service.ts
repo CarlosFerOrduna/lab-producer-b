@@ -1,7 +1,9 @@
 import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Queue } from 'bullmq';
 import { randomUUID } from 'node:crypto';
 import { PUBLISHING } from '../publishing/constants/publishing.constant';
-import type { EventPublisher } from '../publishing/types/event-publisher.type';
+import { PublishedEvent } from '../publishing/types/published-event.type';
+import { EVENT_QUEUE } from '../queue/constants/event-queue.constant';
 import { CreateItemDto } from './dto/create-item.dto';
 import { ListItemsDto } from './dto/list-items.dto';
 import { ItemEntity } from './entities/item.entity';
@@ -13,13 +15,13 @@ export class ItemsService {
 
   constructor(
     private readonly itemsRepository: ItemsRepository,
-    @Inject(PUBLISHING.eventPublisherToken) private readonly eventPublisher: EventPublisher,
+    @Inject(EVENT_QUEUE.queueToken) private readonly eventQueue: Queue<PublishedEvent>,
   ) {}
 
-  /** Adds an item to the catalog, then publishes item.created. */
+  /** Adds an item to the catalog, then queues item.created for the worker to publish. */
   async create(newItem: CreateItemDto): Promise<ItemEntity> {
     const item = await this.itemsRepository.addToCatalog(newItem);
-    await this.publishItemCreated(item);
+    await this.queueItemCreated(item);
     return item;
   }
 
@@ -36,19 +38,21 @@ export class ItemsService {
     return item;
   }
 
-  private async publishItemCreated(item: ItemEntity): Promise<void> {
+  private async queueItemCreated(item: ItemEntity): Promise<void> {
+    const event: PublishedEvent = {
+      id: randomUUID(),
+      source: PUBLISHING.eventSource,
+      type: 'item.created',
+      occurredAt: item.createdAt.toISOString(),
+      payload: { itemId: item.id, name: item.name, quantity: item.quantity },
+    };
+
     try {
-      await this.eventPublisher.publish({
-        id: randomUUID(),
-        source: PUBLISHING.eventSource,
-        type: 'item.created',
-        occurredAt: item.createdAt.toISOString(),
-        payload: { itemId: item.id, name: item.name, quantity: item.quantity },
-      });
+      await this.eventQueue.add(EVENT_QUEUE.jobName, event, { jobId: event.id });
     } catch (error) {
-      // El item ya quedó guardado: sin un outbox transaccional el evento se pierde, así que al menos queda registrado.
+      // Escritura doble: el item ya quedó guardado y el evento no. Sin outbox (etapa 07), al menos queda registrado.
       this.logger.error(
-        `Item ${item.id} was saved but its item.created event was not published`,
+        `Item ${item.id} was saved but its item.created event was not queued`,
         error instanceof Error ? error.stack : String(error),
       );
     }

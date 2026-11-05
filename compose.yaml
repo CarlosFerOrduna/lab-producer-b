@@ -1,10 +1,26 @@
-# Today's starting point: PostgreSQL bundled in the service's own compose.
-# POSTGRES_PASSWORD comes from a local .env file, which is never committed.
+# PostgreSQL, the queue's Valkey, the API and the worker. The worker
+# publishes to the processor started by lab-processor's compose, through the host.
+# The passwords come from a local .env file, which is never committed.
 x-database: &database
   DATABASE_HOST: postgres
   DATABASE_NAME: producer_b
   DATABASE_USER: producer_b
   DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
+x-queue: &queue
+  QUEUE_HOST: valkey-queue
+  QUEUE_PASSWORD: ${VALKEY_QUEUE_PASSWORD:?Set VALKEY_QUEUE_PASSWORD in .env}
+
+x-valkey: &valkey
+  image: valkey/valkey:9.1.3-alpine@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
+  # The image's valkey user, from the start: no root and no user switch at startup.
+  user: '999:1000'
+  command: ['valkey-server', '/etc/valkey/valkey.conf']
+  healthcheck:
+    test: ['CMD-SHELL', 'valkey-cli ping | grep -q PONG']
+    interval: 2s
+    timeout: 3s
+    retries: 15
 
 services:
   postgres:
@@ -21,6 +37,18 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql
 
+  valkey-queue:
+    <<: *valkey
+    environment:
+      REDISCLI_AUTH: ${VALKEY_QUEUE_PASSWORD:?Set VALKEY_QUEUE_PASSWORD in .env}
+    configs:
+      - source: valkey-queue-config
+        target: /etc/valkey/valkey.conf
+      - source: valkey-queue-auth
+        target: /etc/valkey/auth.conf
+    volumes:
+      - valkey-queue-data:/data
+
   migrate:
     build: .
     image: lab-producer-b:local
@@ -33,15 +61,34 @@ services:
   producer-b:
     image: lab-producer-b:local
     environment:
-      <<: *database
-      PROCESSOR_URL: http://host.docker.internal:3000
-    extra_hosts:
-      - host.docker.internal:host-gateway
+      <<: [*database, *queue]
     ports:
       - '3002:3000'
     depends_on:
       migrate:
         condition: service_completed_successfully
+      valkey-queue:
+        condition: service_healthy
+
+  producer-b-worker:
+    image: lab-producer-b:local
+    command: ['node', 'dist/worker.js']
+    environment:
+      <<: *queue
+      PROCESSOR_URL: http://host.docker.internal:3000
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      valkey-queue:
+        condition: service_healthy
+
+configs:
+  valkey-queue-config:
+    file: ./valkey/queue.conf
+  valkey-queue-auth:
+    content: |
+      requirepass ${VALKEY_QUEUE_PASSWORD}
 
 volumes:
   postgres-data:
+  valkey-queue-data:

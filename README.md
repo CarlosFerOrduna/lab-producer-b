@@ -11,31 +11,33 @@ Runs in its own `producer-b` namespace of the k3s cluster. [lab-producer-a](http
 Today:
 
 - `GET /health` returns `200 {"status":"ok"}`.
-- An item catalog (see [API](#api)) in its own PostgreSQL, accessed through TypeORM. Adding an item publishes an `item.created` event to the processor.
-- Events go out through an `EventPublisher` interface. Today it posts them to the processor over HTTP, retrying transient failures; the Kafka stage replaces only that implementation.
+- An item catalog (see [API](#api)) in its own PostgreSQL, accessed through TypeORM. Adding an item queues an `item.created` event in its own Valkey with BullMQ.
+- A separate worker process takes the events from the queue and publishes them to the processor over HTTP, through an `EventPublisher` interface; the Kafka stage replaces only that implementation. Retries, with backoff, belong to the queue (see [Queue](#queue)).
+- `GET /health` for liveness and `GET /health/ready` for readiness: ready only if the database answers and the queue accepts writes.
 - The schema lives in versioned SQL migrations (`migrations/postgres/`), applied by a separate command before the service starts.
 - Environment configuration validated at startup with Joi.
 - Multi-stage `Dockerfile` that runs as the unprivileged `node` user, on a base image pinned by digest.
-- A `compose.yaml` that reproduces today's starting point: PostgreSQL bundled in the service's own compose.
+- A `compose.yaml` with PostgreSQL, the queue's Valkey, the API and the worker.
 - npm scripts that CI will call:
 
-| Script              | What it does                                              |
-| ------------------- | --------------------------------------------------------- |
-| `npm run lint`      | ESLint, without `--fix`, so violations fail the build.    |
-| `npm run migrate`   | Applies the pending migrations (`dist/migrate.js`).       |
-| `npm test`          | Jest unit tests (`*.spec.ts` next to the code they test). |
-| `npm run build`     | Compiles to `dist/`.                                      |
-| `npm start`         | Runs `dist/main`.                                         |
-| `npm run start:dev` | Watch mode for local work.                                |
-| `npm run format`    | Prettier over `src/`.                                     |
+| Script                 | What it does                                              |
+| ---------------------- | --------------------------------------------------------- |
+| `npm run lint`         | ESLint, without `--fix`, so violations fail the build.    |
+| `npm run migrate`      | Applies the pending migrations (`dist/migrate.js`).       |
+| `npm test`             | Jest unit tests (`*.spec.ts` next to the code they test). |
+| `npm run build`        | Compiles to `dist/`.                                      |
+| `npm start`            | Runs the API (`dist/main`).                               |
+| `npm run start:worker` | Runs the worker (`dist/worker`).                          |
+| `npm run start:dev`    | Watch mode for local work.                                |
+| `npm run format`       | Prettier over `src/`.                                     |
 
 NestJS 12 ships as ES modules only, so `npm test` runs Jest with `--experimental-vm-modules`.
 
 Planned:
 
-- Publish events to Kafka topics under `producer-b.*`, replacing the HTTP publisher, with a transactional outbox so a saved item never loses its event.
+- Publish events to Kafka topics under `producer-b.*`, replacing the HTTP publisher in the worker, with a transactional outbox so a saved item never loses its event.
 - Call the processor through the platform gateway, never directly.
-- One Redis for cache and a separate Redis for BullMQ queues.
+- A second Valkey, used only as a cache for `GET /items/:id`.
 - Its own PostgreSQL, in two steps:
   1. Start with PostgreSQL bundled in the service's docker compose. **(Today.)** This is the other pattern services use today, next to the embedded SQLite that [lab-processor](https://github.com/CarlosFerOrduna/lab-processor) starts with.
   2. Move that PostgreSQL out of the service's package and into the cluster, as a StatefulSet with its own volume, its own Secret and its own lifecycle, migrating its data. Same engine: the change is where and how the database lives, not what it is.
@@ -45,54 +47,71 @@ Planned:
 
 Requires Node 26 (see `.nvmrc`) and Docker. Events go to the processor of [lab-processor](https://github.com/CarlosFerOrduna/lab-processor)'s compose, on port 3000.
 
-Create a local `.env` with the database password for compose. It is ignored by git and never committed:
+Create a local `.env` with the passwords for compose. It is ignored by git and never committed:
 
 ```bash
-printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 16)" > .env
+for name in POSTGRES_PASSWORD VALKEY_QUEUE_PASSWORD; do
+  printf '%s=%s\n' "$name" "$(openssl rand -hex 24)"
+done > .env
 chmod 600 .env
 ```
 
-Everything in Docker Compose, on port 3002:
+Everything in Docker Compose, with the API on port 3002:
 
 ```bash
 docker compose up --build
 ```
 
-`postgres` starts first; `migrate` waits until it is healthy, applies the migrations and exits; `producer-b` starts only after that succeeds. The data lives in the `postgres-data` volume (`docker compose down -v` deletes it). The container reaches the processor through the host (`host.docker.internal`).
-
-The service itself never reads `.env`: compose uses it to fill in `compose.yaml`, and passes real environment variables to the containers.
+- `postgres` and `migrate`: the database and its migrations, as before.
+- `valkey-queue` (`valkey/queue.conf`: AOF, `noeviction`, 128 MB). It runs as its own user (999), and reads its password from a separate config file that compose builds from `.env` (`include`), never from the command line.
+- `producer-b`: the API. `producer-b-worker`: the same image running `node dist/worker.js`, which reaches the processor through the host.
 
 ## API
 
-| Method and path  | What it does                                                                                                        |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `POST /items`    | Body `{ "name": "...", "quantity": 0 }`. Stores the item, publishes `item.created` and answers `201` with the item. |
-| `GET /items`     | The latest items first. Optional `limit` (1 to 100, default 20) and `offset`.                                       |
-| `GET /items/:id` | One item, or `404`.                                                                                                 |
+| Method and path     | What it does                                                                                                            |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `POST /items`       | Body `{ "name": "...", "quantity": 0 }`. Stores the item, queues `item.created` and answers `201` with the item.        |
+| `GET /items`        | The latest items first, from the database. Optional `limit` (1 to 100, default 20) and `offset`.                        |
+| `GET /items/:id`    | One item, or `404`.                                                                                                     |
+| `GET /health`       | `200` while the process is up. Never checks a dependency.                                                               |
+| `GET /health/ready` | `200` if the database answers and the queue accepts a write, each within 1 s; `503` otherwise, naming which one failed. |
 
 ```bash
 curl -X POST localhost:3002/items -H 'content-type: application/json' -d '{"name":"first","quantity":2}'
-curl 'localhost:3000/events?source=producer-b'   # on the processor
+curl localhost:3002/items/<id>
+curl 'localhost:3000/events?source=producer-b'   # on the processor, once the worker publishes it
 ```
 
-Publishing makes up to 3 attempts with exponential backoff and a 2 s timeout each. **Known gap:** the item is saved before the event is published, in two separate steps. If the processor stays down, the item is kept, the event is lost, and only an error log says so. A transactional outbox (the event saved in the same transaction as the item, and published afterwards) closes that gap; it is planned with Kafka.
+**Known gap:** the item is saved before its event is queued, in two separate steps. If the queue is down at that moment, the item is kept, the event is lost, and only an error log says so (the queue makes this much less likely than publishing straight to the processor, but does not rule it out). A transactional outbox closes that gap; it is planned with Kafka.
+
+## Queue
+
+- BullMQ queue `events` on its own Valkey. The job id is the event id, so the same event queued twice is stored once, and the processor stores each id once.
+- The worker publishes with a single HTTP attempt. On failure, BullMQ retries with a backoff that doubles from 1 s up to 60 s, for 1440 attempts (about a day).
+- A `4xx` from the processor means a malformed event: the worker throws `UnrecoverableError` and the job fails at once, without retries.
+- With `noeviction`, Valkey never frees memory on its own, so finished jobs are trimmed: the last 1000 completed, and failed ones for 7 days.
+- On `SIGTERM` the worker calls `worker.close()`: it finishes the jobs in progress before exiting.
+- The queue is stored with AOF (`appendfsync everysec`): events survive a Valkey restart, and at most the last second of writes is lost if the machine stops abruptly.
 
 ## Configuration
 
-The service reads only real environment variables. `.env` files are ignored by the service, so pass values in the shell or with `docker run -e`.
+The service reads only real environment variables. `.env` files are ignored by the service: compose uses `.env` only to fill in `compose.yaml`.
 
-| Variable            | Default      | Validation                                                |
-| ------------------- | ------------ | --------------------------------------------------------- |
-| `NODE_ENV`          | `production` | One of `development`, `test`, `production`.               |
-| `PORT`              | `3000`       | A valid TCP port number.                                  |
-| `PROCESSOR_URL`     | required     | `http` or `https` URL of the processor.                   |
-| `DATABASE_HOST`     | required     | Host name of PostgreSQL.                                  |
-| `DATABASE_PORT`     | `5432`       | A valid TCP port number.                                  |
-| `DATABASE_NAME`     | required     | Database name.                                            |
-| `DATABASE_USER`     | required     | Database user.                                            |
-| `DATABASE_PASSWORD` | required     | Database password. In the cluster it comes from a Secret. |
+| Variable            | Used by            | Default      | Validation                                                     |
+| ------------------- | ------------------ | ------------ | -------------------------------------------------------------- |
+| `NODE_ENV`          | API and worker     | `production` | One of `development`, `test`, `production`.                    |
+| `PORT`              | API and worker     | `3000`       | A valid TCP port number. The worker serves only `GET /health`. |
+| `DATABASE_HOST`     | API and migrations | required     | Host name of PostgreSQL.                                       |
+| `DATABASE_PORT`     | API and migrations | `5432`       | A valid TCP port number.                                       |
+| `DATABASE_NAME`     | API and migrations | required     | Database name.                                                 |
+| `DATABASE_USER`     | API and migrations | required     | Database user.                                                 |
+| `DATABASE_PASSWORD` | API and migrations | required     | Database password. In the cluster it comes from a Secret.      |
+| `QUEUE_HOST`        | API and worker     | required     | Host name of the queue's Valkey.                               |
+| `QUEUE_PORT`        | API and worker     | `6379`       | A valid TCP port number.                                       |
+| `QUEUE_PASSWORD`    | API and worker     | required     | The queue's Valkey password. In the cluster, from a Secret.    |
+| `PROCESSOR_URL`     | worker             | required     | `http` or `https` URL of the processor.                        |
 
-`npm run migrate` needs only the `DATABASE_*` variables. An invalid value stops the service at startup with a validation error. The image carries no environment-specific values: the same image runs in dev, stage and prod, and each environment's values come from its overlay in [lab-gitops](https://github.com/CarlosFerOrduna/lab-gitops).
+An invalid value stops the process at startup with a validation error. The image carries no environment-specific values: the same image runs in dev, stage and prod, and each environment's values come from its overlay in [lab-gitops](https://github.com/CarlosFerOrduna/lab-gitops).
 
 ## Migrations
 
