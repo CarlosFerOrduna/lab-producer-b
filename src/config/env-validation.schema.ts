@@ -20,10 +20,13 @@ export const databaseEnvValidationSchema = Joi.object({
   DATABASE_PASSWORD: Joi.string().required(),
 });
 
-/** What the API needs: the database and the queue. */
+/** What the API needs: the database, the queue and the cache. */
 export const apiEnvValidationSchema = databaseEnvValidationSchema.keys({
   ...processEnvKeys,
   ...queueEnvKeys,
+  CACHE_HOST: Joi.string().hostname().required(),
+  CACHE_PORT: Joi.number().port().default(6379),
+  CACHE_PASSWORD: Joi.string().required(),
 });
 
 /** What the worker needs: the queue, and where to publish the events. */

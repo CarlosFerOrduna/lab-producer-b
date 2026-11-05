@@ -13,11 +13,12 @@ Today:
 - `GET /health` returns `200 {"status":"ok"}`.
 - An item catalog (see [API](#api)) in its own PostgreSQL, accessed through TypeORM. Adding an item queues an `item.created` event in its own Valkey with BullMQ.
 - A separate worker process takes the events from the queue and publishes them to the processor over HTTP, through an `EventPublisher` interface; the Kafka stage replaces only that implementation. Retries, with backoff, belong to the queue (see [Queue](#queue)).
-- `GET /health` for liveness and `GET /health/ready` for readiness: ready only if the database answers and the queue accepts writes.
+- `GET /items/:id` reads through a second Valkey, used only as a cache (see [Cache](#cache)).
+- `GET /health` for liveness and `GET /health/ready` for readiness: ready only if the database answers and the queue accepts writes; never depends on the cache.
 - The schema lives in versioned SQL migrations (`migrations/postgres/`), applied by a separate command before the service starts.
 - Environment configuration validated at startup with Joi.
 - Multi-stage `Dockerfile` that runs as the unprivileged `node` user, on a base image pinned by digest.
-- A `compose.yaml` with PostgreSQL, the queue's Valkey, the API and the worker.
+- A `compose.yaml` with PostgreSQL, the queue's and the cache's Valkey, the API and the worker.
 - npm scripts that CI will call:
 
 | Script                 | What it does                                              |
@@ -37,7 +38,6 @@ Planned:
 
 - Publish events to Kafka topics under `producer-b.*`, replacing the HTTP publisher in the worker, with a transactional outbox so a saved item never loses its event.
 - Call the processor through the platform gateway, never directly.
-- A second Valkey, used only as a cache for `GET /items/:id`.
 - Its own PostgreSQL, in two steps:
   1. Start with PostgreSQL bundled in the service's docker compose. **(Today.)** This is the other pattern services use today, next to the embedded SQLite that [lab-processor](https://github.com/CarlosFerOrduna/lab-processor) starts with.
   2. Move that PostgreSQL out of the service's package and into the cluster, as a StatefulSet with its own volume, its own Secret and its own lifecycle, migrating its data. Same engine: the change is where and how the database lives, not what it is.
@@ -50,7 +50,7 @@ Requires Node 26 (see `.nvmrc`) and Docker. Events go to the processor of [lab-p
 Create a local `.env` with the passwords for compose. It is ignored by git and never committed:
 
 ```bash
-for name in POSTGRES_PASSWORD VALKEY_QUEUE_PASSWORD; do
+for name in POSTGRES_PASSWORD VALKEY_QUEUE_PASSWORD VALKEY_CACHE_PASSWORD; do
   printf '%s=%s\n' "$name" "$(openssl rand -hex 24)"
 done > .env
 chmod 600 .env
@@ -63,22 +63,22 @@ docker compose up --build
 ```
 
 - `postgres` and `migrate`: the database and its migrations, as before.
-- `valkey-queue` (`valkey/queue.conf`: AOF, `noeviction`, 128 MB). It runs as its own user (999), and reads its password from a separate config file that compose builds from `.env` (`include`), never from the command line.
+- `valkey-queue` (`valkey/queue.conf`: AOF, `noeviction`, 128 MB) and `valkey-cache` (`valkey/cache.conf`: no persistence, `allkeys-lru`, 64 MB). Both run as their own user (999), each with its own password, read from a separate config file that compose builds from `.env` (`include`), never from the command line.
 - `producer-b`: the API. `producer-b-worker`: the same image running `node dist/worker.js`, which reaches the processor through the host.
 
 ## API
 
-| Method and path     | What it does                                                                                                            |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `POST /items`       | Body `{ "name": "...", "quantity": 0 }`. Stores the item, queues `item.created` and answers `201` with the item.        |
-| `GET /items`        | The latest items first, from the database. Optional `limit` (1 to 100, default 20) and `offset`.                        |
-| `GET /items/:id`    | One item, or `404`.                                                                                                     |
-| `GET /health`       | `200` while the process is up. Never checks a dependency.                                                               |
-| `GET /health/ready` | `200` if the database answers and the queue accepts a write, each within 1 s; `503` otherwise, naming which one failed. |
+| Method and path     | What it does                                                                                                                                    |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /items`       | Body `{ "name": "...", "quantity": 0 }`. Stores the item, queues `item.created` and answers `201` with the item.                                |
+| `GET /items`        | The latest items first, from the database. Optional `limit` (1 to 100, default 20) and `offset`.                                                |
+| `GET /items/:id`    | One item, or `404`. Reads through the cache and answers with `X-Cache: HIT` or `X-Cache: MISS`.                                                 |
+| `GET /health`       | `200` while the process is up. Never checks a dependency.                                                                                       |
+| `GET /health/ready` | `200` if the database answers and the queue accepts a write, each within 1 s; `503` otherwise, naming which one failed. Never checks the cache. |
 
 ```bash
 curl -X POST localhost:3002/items -H 'content-type: application/json' -d '{"name":"first","quantity":2}'
-curl localhost:3002/items/<id>
+curl -i localhost:3002/items/<id>                 # X-Cache: MISS, then HIT
 curl 'localhost:3000/events?source=producer-b'   # on the processor, once the worker publishes it
 ```
 
@@ -92,6 +92,12 @@ curl 'localhost:3000/events?source=producer-b'   # on the processor, once the wo
 - With `noeviction`, Valkey never frees memory on its own, so finished jobs are trimmed: the last 1000 completed, and failed ones for 7 days.
 - On `SIGTERM` the worker calls `worker.close()`: it finishes the jobs in progress before exiting.
 - The queue is stored with AOF (`appendfsync everysec`): events survive a Valkey restart, and at most the last second of writes is lost if the machine stops abruptly.
+
+## Cache
+
+- Cache-aside on `GET /items/:id`: read the cache, and on a miss read the database and store the item for 5 minutes (`item:<id>`). Items never change, so the TTL only bounds memory.
+- The cache is never required: any cache failure (down, slow, full) counts as a miss and the item comes from the database. Commands time out after 100 ms and are never queued while the cache is disconnected, so a dead cache costs a database read, not a slow response.
+- No persistence and `allkeys-lru`: a restart starts empty, and when full it evicts the least recently used items.
 
 ## Configuration
 
@@ -109,6 +115,9 @@ The service reads only real environment variables. `.env` files are ignored by t
 | `QUEUE_HOST`        | API and worker     | required     | Host name of the queue's Valkey.                               |
 | `QUEUE_PORT`        | API and worker     | `6379`       | A valid TCP port number.                                       |
 | `QUEUE_PASSWORD`    | API and worker     | required     | The queue's Valkey password. In the cluster, from a Secret.    |
+| `CACHE_HOST`        | API                | required     | Host name of the cache's Valkey.                               |
+| `CACHE_PORT`        | API                | `6379`       | A valid TCP port number.                                       |
+| `CACHE_PASSWORD`    | API                | required     | The cache's Valkey password. In the cluster, from a Secret.    |
 | `PROCESSOR_URL`     | worker             | required     | `http` or `https` URL of the processor.                        |
 
 An invalid value stops the process at startup with a validation error. The image carries no environment-specific values: the same image runs in dev, stage and prod, and each environment's values come from its overlay in [lab-gitops](https://github.com/CarlosFerOrduna/lab-gitops).

@@ -7,7 +7,9 @@ import { EVENT_QUEUE } from '../queue/constants/event-queue.constant';
 import { CreateItemDto } from './dto/create-item.dto';
 import { ListItemsDto } from './dto/list-items.dto';
 import { ItemEntity } from './entities/item.entity';
+import { ItemsCacheService } from './items-cache.service';
 import { ItemsRepository } from './items.repository';
+import { ItemLookup } from './types/item-lookup.type';
 
 @Injectable()
 export class ItemsService {
@@ -15,6 +17,7 @@ export class ItemsService {
 
   constructor(
     private readonly itemsRepository: ItemsRepository,
+    private readonly itemsCache: ItemsCacheService,
     @Inject(EVENT_QUEUE.queueToken) private readonly eventQueue: Queue<PublishedEvent>,
   ) {}
 
@@ -29,13 +32,20 @@ export class ItemsService {
     return this.itemsRepository.findLatest(query);
   }
 
-  async getById(id: string): Promise<ItemEntity> {
+  /** Reads through the cache: a hit skips the database, a miss reads it and fills the cache. */
+  async getById(id: string): Promise<ItemLookup> {
+    const cachedItem = await this.itemsCache.find(id);
+    if (cachedItem) {
+      return { item: cachedItem, cacheStatus: 'HIT' };
+    }
+
     const item = await this.itemsRepository.findOneBy({ id });
     if (!item) {
       throw new NotFoundException(`Item ${id} not found`);
     }
+    await this.itemsCache.remember(item);
 
-    return item;
+    return { item, cacheStatus: 'MISS' };
   }
 
   private async queueItemCreated(item: ItemEntity): Promise<void> {

@@ -7,7 +7,7 @@ import { EVENT_QUEUE } from '../queue/constants/event-queue.constant';
 const DEPENDENCY_TIMEOUT_MS = 1000;
 const READINESS_KEY = 'health:producer-b:ready';
 
-/** Readiness checks the database and the queue. */
+/** Readiness checks the database and the queue. Never the cache: without it the service still answers. */
 @Controller('health')
 export class ReadinessController {
   constructor(

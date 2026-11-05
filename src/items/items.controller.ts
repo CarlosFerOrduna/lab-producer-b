@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { JoiValidationPipe } from '../common/pipes/joi-validation.pipe';
 import { CreateItemDto, createItemSchema } from './dto/create-item.dto';
 import { ListItemsDto, listItemsSchema } from './dto/list-items.dto';
@@ -19,8 +20,14 @@ export class ItemsController {
     return this.itemsService.list(query);
   }
 
+  /** Answers with the X-Cache header (HIT or MISS), so the cache's effect is visible from outside. */
   @Get(':id')
-  getById(@Param('id', ParseUUIDPipe) id: string): Promise<ItemEntity> {
-    return this.itemsService.getById(id);
+  async getById(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<ItemEntity> {
+    const { item, cacheStatus } = await this.itemsService.getById(id);
+    response.setHeader('X-Cache', cacheStatus);
+    return item;
   }
 }

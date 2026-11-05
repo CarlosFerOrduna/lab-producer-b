@@ -1,6 +1,7 @@
 import { NotFoundException } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import { ItemEntity } from './entities/item.entity';
+import { ItemsCacheService } from './items-cache.service';
 import { ItemsRepository } from './items.repository';
 import { ItemsService } from './items.service';
 
@@ -12,13 +13,19 @@ describe('ItemsService', () => {
     createdAt: new Date('2026-11-05T18:00:00.000Z'),
   });
   let itemsRepository: jest.Mocked<Pick<ItemsRepository, 'addToCatalog' | 'findOneBy'>>;
+  let itemsCache: jest.Mocked<Pick<ItemsCacheService, 'find' | 'remember'>>;
   let add: jest.Mock;
   let service: ItemsService;
 
   beforeEach(() => {
     itemsRepository = { addToCatalog: jest.fn().mockResolvedValue(savedItem), findOneBy: jest.fn() };
+    itemsCache = { find: jest.fn(), remember: jest.fn().mockResolvedValue(undefined) };
     add = jest.fn().mockResolvedValue(undefined);
-    service = new ItemsService(itemsRepository as unknown as ItemsRepository, { add } as unknown as Queue);
+    service = new ItemsService(
+      itemsRepository as unknown as ItemsRepository,
+      itemsCache as unknown as ItemsCacheService,
+      { add } as unknown as Queue,
+    );
   });
 
   it('queues item.created after saving the item, with the event id as the job id', async () => {
@@ -42,13 +49,23 @@ describe('ItemsService', () => {
     await expect(service.create({ name: 'first', quantity: 2 })).resolves.toBe(savedItem);
   });
 
-  it('returns the item from the database', async () => {
+  it('answers from the cache on a hit, without reading the database', async () => {
+    itemsCache.find.mockResolvedValue(savedItem);
+
+    await expect(service.getById(savedItem.id)).resolves.toEqual({ item: savedItem, cacheStatus: 'HIT' });
+    expect(itemsRepository.findOneBy).not.toHaveBeenCalled();
+  });
+
+  it('reads the database on a miss, and fills the cache', async () => {
+    itemsCache.find.mockResolvedValue(null);
     itemsRepository.findOneBy.mockResolvedValue(savedItem);
 
-    await expect(service.getById(savedItem.id)).resolves.toBe(savedItem);
+    await expect(service.getById(savedItem.id)).resolves.toEqual({ item: savedItem, cacheStatus: 'MISS' });
+    expect(itemsCache.remember).toHaveBeenCalledWith(savedItem);
   });
 
   it('fails with not found when the item does not exist', async () => {
+    itemsCache.find.mockResolvedValue(null);
     itemsRepository.findOneBy.mockResolvedValue(null);
 
     await expect(service.getById(savedItem.id)).rejects.toThrow(NotFoundException);

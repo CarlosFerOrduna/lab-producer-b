@@ -1,4 +1,4 @@
-# PostgreSQL, the queue's Valkey, the API and the worker. The worker
+# PostgreSQL, the queue's and the cache's Valkey, the API and the worker. The worker
 # publishes to the processor started by lab-processor's compose, through the host.
 # The passwords come from a local .env file, which is never committed.
 x-database: &database
@@ -49,6 +49,16 @@ services:
     volumes:
       - valkey-queue-data:/data
 
+  valkey-cache:
+    <<: *valkey
+    environment:
+      REDISCLI_AUTH: ${VALKEY_CACHE_PASSWORD:?Set VALKEY_CACHE_PASSWORD in .env}
+    configs:
+      - source: valkey-cache-config
+        target: /etc/valkey/valkey.conf
+      - source: valkey-cache-auth
+        target: /etc/valkey/auth.conf
+
   migrate:
     build: .
     image: lab-producer-b:local
@@ -62,12 +72,16 @@ services:
     image: lab-producer-b:local
     environment:
       <<: [*database, *queue]
+      CACHE_HOST: valkey-cache
+      CACHE_PASSWORD: ${VALKEY_CACHE_PASSWORD:?Set VALKEY_CACHE_PASSWORD in .env}
     ports:
       - '3002:3000'
     depends_on:
       migrate:
         condition: service_completed_successfully
       valkey-queue:
+        condition: service_healthy
+      valkey-cache:
         condition: service_healthy
 
   producer-b-worker:
@@ -88,6 +102,11 @@ configs:
   valkey-queue-auth:
     content: |
       requirepass ${VALKEY_QUEUE_PASSWORD}
+  valkey-cache-config:
+    file: ./valkey/cache.conf
+  valkey-cache-auth:
+    content: |
+      requirepass ${VALKEY_CACHE_PASSWORD}
 
 volumes:
   postgres-data:
