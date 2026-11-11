@@ -1,5 +1,6 @@
-# PostgreSQL, the queue's and the cache's Valkey, the API and the worker. The worker
-# publishes to the processor started by lab-processor's compose, through the host.
+# PostgreSQL, the queue's and the cache's Valkey, and the API. The worker publishes to
+# Kafka with mTLS, which compose does not run: it runs only in the cluster, and here
+# events wait in the queue.
 # The passwords come from a local .env file, which is never committed.
 x-database: &database
   DATABASE_HOST: postgres
@@ -82,18 +83,6 @@ services:
       valkey-queue:
         condition: service_healthy
       valkey-cache:
-        condition: service_healthy
-
-  producer-b-worker:
-    image: lab-producer-b:local
-    command: ['node', 'dist/worker.js']
-    environment:
-      <<: *queue
-      PROCESSOR_URL: http://host.docker.internal:3000
-    extra_hosts:
-      - host.docker.internal:host-gateway
-    depends_on:
-      valkey-queue:
         condition: service_healthy
 
 configs:
