@@ -1,6 +1,6 @@
 # lab-producer-b
 
-One of the two producer services of the lab: a NestJS service that will publish events to Kafka for [lab-processor](https://github.com/CarlosFerOrduna/lab-processor) to consume.
+One of the two producer services of the lab: a NestJS service that publishes events to Kafka for [lab-processor](https://github.com/CarlosFerOrduna/lab-processor) to consume.
 
 ## Role in the lab
 
@@ -12,13 +12,13 @@ Today:
 
 - `GET /health` returns `200 {"status":"ok"}`.
 - An item catalog (see [API](#api)) in its own PostgreSQL, accessed through TypeORM. Adding an item queues an `item.created` event in its own Valkey with BullMQ.
-- A separate worker process takes the events from the queue and publishes them to the processor over HTTP, through an `EventPublisher` interface; the Kafka stage replaces only that implementation. Retries, with backoff, belong to the queue (see [Queue](#queue)).
+- A separate worker process takes the events from the queue and publishes them to the Kafka topic `producer-b.items`, with its own client certificate (mTLS), through an `EventPublisher` interface (see [Kafka publishing](#kafka-publishing)). Retries, with backoff, belong to the queue (see [Queue](#queue)).
 - `GET /items/:id` reads through a second Valkey, used only as a cache (see [Cache](#cache)).
 - `GET /health` for liveness and `GET /health/ready` for readiness: ready only if the database answers and the queue accepts writes; never depends on the cache.
 - The schema lives in versioned SQL migrations (`migrations/postgres/`), applied by a separate command before the service starts.
 - Environment configuration validated at startup with Joi.
 - Multi-stage `Dockerfile` that runs as the unprivileged `node` user, on a base image pinned by digest.
-- A `compose.yaml` with PostgreSQL, the queue's and the cache's Valkey, the API and the worker.
+- A `compose.yaml` with PostgreSQL, the queue's and the cache's Valkey, and the API. The worker runs only in the cluster, next to Kafka.
 - npm scripts that CI will call:
 
 | Script                 | What it does                                              |
@@ -36,7 +36,7 @@ NestJS 12 ships as ES modules only, so `npm test` runs Jest with `--experimental
 
 Planned:
 
-- Publish events to Kafka topics under `producer-b.*`, replacing the HTTP publisher in the worker, with a transactional outbox so a saved item never loses its event.
+- A transactional outbox, so a saved item never loses its event, and retire the queue, so events of one item keep their order (see [Kafka publishing](#kafka-publishing)).
 - Call the processor through the platform gateway, never directly.
 - Its own PostgreSQL, in two steps:
   1. Start with PostgreSQL bundled in the service's docker compose. **(Today.)** This is the other pattern services use today, next to the embedded SQLite that [lab-processor](https://github.com/CarlosFerOrduna/lab-processor) starts with.
@@ -45,7 +45,7 @@ Planned:
 
 ## Run locally
 
-Requires Node 26 (see `.nvmrc`) and Docker. Events go to the processor of [lab-processor](https://github.com/CarlosFerOrduna/lab-processor)'s compose, on port 3000.
+Requires Node 26 (see `.nvmrc`) and Docker. Compose runs no Kafka, so it runs no worker either: events wait in the local queue.
 
 Create a local `.env` with the passwords for compose. It is ignored by git and never committed:
 
@@ -64,7 +64,7 @@ docker compose up --build
 
 - `postgres` and `migrate`: the database and its migrations, as before.
 - `valkey-queue` (`valkey/queue.conf`: AOF, `noeviction`, 128 MB) and `valkey-cache` (`valkey/cache.conf`: no persistence, `allkeys-lru`, 64 MB). Both run as their own user (999), each with its own password, read from a separate config file that compose builds from `.env` (`include`), never from the command line.
-- `producer-b`: the API. `producer-b-worker`: the same image running `node dist/worker.js`, which reaches the processor through the host.
+- `producer-b`: the API. The worker is the same image running `node dist/worker.js`, in the cluster only.
 
 ## API
 
@@ -78,17 +78,16 @@ docker compose up --build
 
 ```bash
 curl -X POST localhost:3002/items -H 'content-type: application/json' -d '{"name":"first","quantity":2}'
-curl -i localhost:3002/items/<id>                 # X-Cache: MISS, then HIT
-curl 'localhost:3000/events?source=producer-b'   # on the processor, once the worker publishes it
+curl -i localhost:3002/items/<id>   # X-Cache: MISS, then HIT
 ```
 
-**Known gap:** the item is saved before its event is queued, in two separate steps. If the queue is down at that moment, the item is kept, the event is lost, and only an error log says so (the queue makes this much less likely than publishing straight to the processor, but does not rule it out). A transactional outbox closes that gap; it is planned with Kafka.
+**Known gap:** the item is saved before its event is queued, in two separate steps. If the queue is down at that moment, the item is kept, the event is lost, and only an error log says so (the queue makes this much less likely than publishing straight to the processor, but does not rule it out). A transactional outbox closes that gap; it is planned.
 
 ## Queue
 
 - BullMQ queue `events` on its own Valkey. The job id is the event id, so the same event queued twice is stored once, and the processor stores each id once.
-- The worker publishes with a single HTTP attempt. On failure, BullMQ retries with a backoff that doubles from 1 s up to 60 s, for 1440 attempts (about a day).
-- A `4xx` from the processor means a malformed event: the worker throws `UnrecoverableError` and the job fails at once, without retries.
+- The worker publishes with a single attempt, bounded by 5 s. On failure, BullMQ retries with a backoff that doubles from 1 s up to 60 s, for 1440 attempts (about a day).
+- A record Kafka refuses (see [Kafka publishing](#kafka-publishing)) means a bad event: the worker throws `UnrecoverableError` and the job fails at once, without retries.
 - With `noeviction`, Valkey never frees memory on its own, so finished jobs are trimmed: the last 1000 completed, and failed ones for 7 days.
 - On `SIGTERM` the worker calls `worker.close()`: it finishes the jobs in progress before exiting.
 - The queue is stored with AOF (`appendfsync everysec`): events survive a Valkey restart, and at most the last second of writes is lost if the machine stops abruptly.
@@ -98,6 +97,29 @@ curl 'localhost:3000/events?source=producer-b'   # on the processor, once the wo
 - Cache-aside on `GET /items/:id`: read the cache, and on a miss read the database and store the item for 5 minutes (`item:<id>`). Items never change, so the TTL only bounds memory.
 - The cache is never required: any cache failure (down, slow, full) counts as a miss and the item comes from the database. Commands time out after 100 ms and are never queued while the cache is disconnected, so a dead cache costs a database read, not a slow response.
 - No persistence and `allkeys-lru`: a restart starts empty, and when full it evicts the least recently used items.
+
+## Kafka publishing
+
+The worker (`node dist/worker.js`, in the cluster the `producer-b-worker` Deployment) publishes each event to the topic `producer-b.items` as the Kafka user `producer-b`, with its own client certificate (mTLS). Its ACL allows writing only to topics under `producer-b.`. It serves only `GET /health`, for its liveness probe.
+
+- **Key**: the item's id (`payload.itemId`), so every event about one item goes to the same partition.
+- **Value**: the whole event as JSON, with its `id`: the processor stores each `id` once.
+- **TLS**: only the CA, the certificate and its key. Node checks the broker's certificate chain and host name, so the brokers are reached by host name, never by IP.
+
+**Delivery is at-least-once.** The producer is idempotent (`acks: all`), so the broker drops the duplicates of the client's own internal retries. It cannot drop BullMQ's: when a send outlasts its 5 s timeout but reaches Kafka later, BullMQ's retry publishes the event again. The processor absorbs those duplicates, since it stores each event `id` once.
+
+**Order per key is not guaranteed yet.** With BullMQ in between, a failed event is retried after later events, so an event can reach Kafka after a newer event about the same item. Publishing from a transactional outbox, without the queue, is planned.
+
+| What happens                                                     | The worker                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Kafka takes the event                                            | Completes the job.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Kafka refuses the record (`MESSAGE_TOO_LARGE`, `INVALID_RECORD`) | Fails the job at once, without retries: sending it again gets the same answer.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Kafka is down, or does not answer within 5 s                     | Fails the attempt; BullMQ retries it with backoff. The event waits in the queue meanwhile.                                                                                                                                                                                                                                                                                                                                                                                         |
+| It cannot reach Kafka when it starts                             | Keeps serving `/health` and takes no job from the queue. A certificate error (`ERR_TLS_*` but a handshake timeout, `*CERT*`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, `*UNKNOWN_CA`) fails at once, since retrying cannot fix it. Anything else is retried every 2 s for at most 120 s. Either way it then logs the root cause (`Could not start publishing: … <- Error[ERR_TLS_CERT_ALTNAME_INVALID]: …`) and exits with 1, and Kubernetes' CrashLoopBackOff decides when to try again. |
+
+The worker takes jobs from the queue only after Kafka answers: before that, a job would only fail and wait for its backoff. The Kafka client gives up a send on its own within about 10 s (2 s to connect, 3 s per request, 2 retries), so sends never pile up in the client while BullMQ retries: by default, an idempotent producer retries forever.
+
+The image carries no optional dependencies (`npm prune --omit=optional`): `@platformatic/kafka` computes CRC32C in WASM instead of the prebuilt native binary of `@node-rs/crc32`, so the image has no native code.
 
 ## Configuration
 
@@ -118,7 +140,17 @@ The service reads only real environment variables. `.env` files are ignored by t
 | `CACHE_HOST`        | API                | required     | Host name of the cache's Valkey.                               |
 | `CACHE_PORT`        | API                | `6379`       | A valid TCP port number.                                       |
 | `CACHE_PASSWORD`    | API                | required     | The cache's Valkey password. In the cluster, from a Secret.    |
-| `PROCESSOR_URL`     | worker             | required     | `http` or `https` URL of the processor.                        |
+
+The worker also needs these (the API ignores them):
+
+| Variable                  | Default             | Validation                                                                 |
+| ------------------------- | ------------------- | -------------------------------------------------------------------------- |
+| `KAFKA_BOOTSTRAP_BROKERS` | required            | Comma-separated `host:port` list. A host name, never an IP: TLS checks it. |
+| `KAFKA_CLIENT_ID`         | `producer-b-worker` | The client id the brokers log.                                             |
+| `KAFKA_TOPIC`             | required            | The topic it publishes to.                                                 |
+| `KAFKA_CA_FILE`           | required            | The CA that verifies the brokers (the lab's root).                         |
+| `KAFKA_CERT_FILE`         | required            | The worker's client certificate (`CN=producer-b`).                         |
+| `KAFKA_KEY_FILE`          | required            | Its private key.                                                           |
 
 An invalid value stops the process at startup with a validation error. The image carries no environment-specific values: the same image runs in dev, stage and prod, and each environment's values come from its overlay in [lab-gitops](https://github.com/CarlosFerOrduna/lab-gitops).
 
